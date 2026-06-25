@@ -324,14 +324,22 @@ async def get_image_key(
         try:
             account_for_dir = str(result.get("wxid") or account or "").strip()
             if account_for_dir:
-                account_dir = _resolve_account_dir(account_for_dir)
-                xor_int = _parse_xor_key(result.get("xor_key", "0"))
-                aes_key16 = _parse_aes_key_bytes(result.get("aes_key", ""))
-                _save_media_keys(account_dir, xor_int, aes_key16)
-                logger.info(
-                    "[keys] 图片密钥已同步写入 _media_keys.json: account=%s xor=0x%02X aes_present=%s",
-                    account_for_dir, xor_int, bool(aes_key16),
-                )
+                try:
+                    account_dir = _resolve_account_dir(account_for_dir)
+                except Exception as path_err:
+                    logger.warning(
+                        "[keys] 账号目录尚未解密，跳过写入 _media_keys.json: account=%s error=%s",
+                        account_for_dir, path_err,
+                    )
+                    account_dir = None
+                if account_dir:
+                    xor_int = _parse_xor_key(result.get("xor_key", "0"))
+                    aes_key16 = _parse_aes_key_bytes(result.get("aes_key", ""))
+                    _save_media_keys(account_dir, xor_int, aes_key16)
+                    logger.info(
+                        "[keys] 图片密钥已同步写入 _media_keys.json: account=%s xor=0x%02X aes_present=%s",
+                        account_for_dir, xor_int, bool(aes_key16),
+                    )
         except Exception as e:
             logger.warning("[keys] 写入 _media_keys.json 失败: %s", e)
 
@@ -386,33 +394,86 @@ async def get_image_key(
 
 
 @router.get("/api/debug/decrypt_dat", summary="调试：测试单个 .dat 文件解密")
+@router.get("/api/debug/decrypt-dat", summary="调试：测试单个 .dat 文件解密（兼容短横线路径）")
 async def debug_decrypt_dat(path: str, account: Optional[str] = None):
     """
-    调试接口，用于验证某个 .dat 文件能否被正确解密。
-    返回解密后的 media_type、数据大小、文件头 hex。
+    调试接口，返回详细字段用以分析解密是否成功。
     """
-    from ..media_helpers import _read_and_maybe_decrypt_media
+    from ..media_helpers import _read_and_maybe_decrypt_media, _detect_wechat_dat_version, _load_media_keys
 
     target = Path(path)
-    if not target.exists() or not target.is_file():
-        return {"status": -1, "errmsg": f"文件不存在: {path}"}
+    path_exists = target.exists() and target.is_file()
 
-    account_dir = _resolve_account_dir(account) if account else None
+    account_dir: Optional[Path] = None
+    account_name = ""
+    try:
+        if account:
+            account_dir = _resolve_account_dir(account)
+            account_name = str(account_dir.name or "")
+    except Exception:
+        account_dir = None
+
+    result: dict[str, Any] = {
+        "status": 0,
+        "errmsg": "ok",
+        "file": str(target),
+        "path_exists": path_exists,
+        "file_size": target.stat().st_size if path_exists else 0,
+        "account": account or "",
+        "account_dir": str(account_dir) if account_dir else "",
+        "media_keys_exists": False,
+        "version": -1,
+        "has_xor": False,
+        "has_aes": False,
+        "aes_len": 0,
+        "media_type": "application/octet-stream",
+        "head16": "",
+    }
+
+    if not path_exists:
+        result["status"] = -1
+        result["errmsg"] = "文件不存在"
+        return result
+
+    # 检测加密版本
+    raw_head = target.read_bytes()[:64]
+    version = _detect_wechat_dat_version(raw_head)
+    result["version"] = version
+
+    # 读取 _media_keys.json
+    if account_dir:
+        media_keys = _load_media_keys(account_dir)
+        if media_keys:
+            result["media_keys_exists"] = True
+            x = media_keys.get("xor")
+            if x is not None:
+                xor_int = int(x)
+                if 0 <= xor_int <= 255:
+                    result["has_xor"] = True
+            aes = str(media_keys.get("aes") or "").strip()
+            if aes:
+                try:
+                    ab = bytes.fromhex(aes)
+                    result["has_aes"] = True
+                    result["aes_len"] = len(ab)
+                except ValueError:
+                    result["aes_len"] = len(aes)
 
     try:
         data, media_type = _read_and_maybe_decrypt_media(target, account_dir=account_dir)
-        head16 = data[:16].hex()
-        return {
-            "status": 0,
-            "errmsg": "ok",
-            "file": str(target),
-            "file_size": len(data),
-            "media_type": media_type,
-            "head16": head16,
-        }
+        result["media_type"] = media_type
+        result["head16"] = data[:16].hex()
+        result["file_size"] = len(data)
     except Exception as e:
-        return {
-            "status": -1,
-            "errmsg": f"解密失败: {e}",
-            "file": str(target),
-        }
+        result["status"] = -1
+        result["errmsg"] = f"解密失败: {e}"
+        return result
+
+    logger.info(
+        "[debug] decrypt_dat: file=%s account=%s version=%d media_keys=%s "
+        "has_xor=%s has_aes=%s aes_len=%d media_type=%s",
+        target.name, account_name, version, result["media_keys_exists"],
+        result["has_xor"], result["has_aes"], result["aes_len"], media_type,
+    )
+
+    return result
