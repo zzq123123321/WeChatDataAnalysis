@@ -3082,7 +3082,7 @@ def _save_media_keys(account_dir: Path, xor_key: int, aes_key16: Optional[bytes]
         aes_str = ""
         if aes_key16:
             try:
-                aes_str = aes_key16.decode("ascii", errors="ignore")[:16]
+                aes_str = aes_key16[:16].hex()
             except Exception:
                 aes_str = ""
         payload = {
@@ -3093,8 +3093,10 @@ def _save_media_keys(account_dir: Path, xor_key: int, aes_key16: Optional[bytes]
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-    except Exception:
-        pass
+        logger.info("[media] _save_media_keys: account=%s xor=%d aes_present=%s",
+                     account_dir.name, int(xor_key), bool(aes_str))
+    except Exception as e:
+        logger.warning("[media] _save_media_keys failed: account=%s error=%s", account_dir.name, e)
 
 
 def _decrypt_wechat_dat_v3(data: bytes, xor_key: int) -> bytes:
@@ -3256,9 +3258,11 @@ def _read_and_maybe_decrypt_media(
         # 不在本项目内做任何密钥提取；仅使用用户保存的密钥（_media_keys.json）。
         xor_key: Optional[int] = None
         aes_key16 = b""
+        has_media_keys = False
         if account_dir is not None:
             try:
                 keys2 = _load_media_keys(account_dir)
+                has_media_keys = bool(keys2)
 
                 x2 = keys2.get("xor")
                 if x2 is not None:
@@ -3267,13 +3271,31 @@ def _read_and_maybe_decrypt_media(
                         xor_key = None
                     else:
                         logger.debug("使用 _media_keys.json 中保存的 xor key")
+                    logger.info(
+                        "[media] decrypt_dat: account=%s version=%d xor_present=%s aes_present=%s path=%s",
+                        account_dir.name, version, bool(xor_key is not None),
+                        bool(aes_key16), path.name,
+                    )
 
                 aes_str = str(keys2.get("aes") or "").strip()
-                if len(aes_str) >= 16:
-                    aes_key16 = aes_str[:16].encode("ascii", errors="ignore")
+                if aes_str:
+                    try:
+                        aes_bytes = bytes.fromhex(aes_str)
+                        if len(aes_bytes) >= 16:
+                            aes_key16 = aes_bytes[:16]
+                        else:
+                            aes_key16 = b""
+                    except ValueError:
+                        aes_key16 = aes_str[:16].encode("ascii", errors="ignore")
             except Exception:
                 xor_key = None
                 aes_key16 = b""
+        logger.info(
+            "[media] decrypt_dat: account=%s version=%d has_media_keys=%s xor_present=%s aes_present=%s path=%s",
+            account_dir.name if account_dir else "?",
+            version, has_media_keys,
+            bool(xor_key is not None), bool(aes_key16), path.name,
+        )
         try:
             if version == 0 and xor_key is not None:
                 out = _decrypt_wechat_dat_v3(data, xor_key)
@@ -3292,6 +3314,7 @@ def _read_and_maybe_decrypt_media(
                         logger.info(f"wxgf->image failed: {path}")
                 mt0 = _detect_image_media_type(out[:32])
                 if mt0 != "application/octet-stream":
+                    logger.info("[media] decrypt_dat V3 success: path=%s media_type=%s bytes=%d", path.name, mt0, len(out))
                     return out, mt0
             elif version == 1 and xor_key is not None:
                 out = _decrypt_wechat_dat_v4(data, xor_key, b"cfcd208495d565ef")
@@ -3310,6 +3333,7 @@ def _read_and_maybe_decrypt_media(
                         logger.info(f"wxgf->image failed: {path}")
                 mt1 = _detect_image_media_type(out[:32])
                 if mt1 != "application/octet-stream":
+                    logger.info("[media] decrypt_dat V4-V1 success: path=%s media_type=%s bytes=%d", path.name, mt1, len(out))
                     return out, mt1
             elif version == 2 and xor_key is not None and aes_key16:
                 out = _decrypt_wechat_dat_v4(data, xor_key, aes_key16)
@@ -3328,6 +3352,7 @@ def _read_and_maybe_decrypt_media(
                         logger.info(f"wxgf->image failed: {path}")
                 mt2b = _detect_image_media_type(out[:32])
                 if mt2b != "application/octet-stream":
+                    logger.info("[media] decrypt_dat V4-V2 success: path=%s media_type=%s bytes=%d", path.name, mt2b, len(out))
                     return out, mt2b
         except Exception:
             pass

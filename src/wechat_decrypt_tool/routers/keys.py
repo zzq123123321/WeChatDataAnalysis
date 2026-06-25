@@ -6,7 +6,7 @@ from fastapi import APIRouter
 from ..logging_config import get_logger
 from ..key_store import get_account_keys_from_store, normalize_key_store_path
 from ..key_service import get_db_key_workflow, get_image_key_integrated_workflow
-from ..media_helpers import _load_media_keys, _resolve_account_dir
+from ..media_helpers import _load_media_keys, _resolve_account_dir, _save_media_keys
 from ..path_fix import PathFixRoute
 
 router = APIRouter(route_class=PathFixRoute)
@@ -225,14 +225,17 @@ async def get_saved_keys(
     }
 
 
-@router.get("/api/get_keys", summary="自动获取微信数据库与图片密钥")
+@router.get("/api/get_keys", summary="自动获取微信数据库密钥（仅 DB Key）")
 async def get_wechat_db_key(wechat_install_path: Optional[str] = None):
     """
     自动流程：
     1. 结束微信进程
     2. 启动微信
-    3. 根据版本注入双 Hook
-    4. 抓取 DB 与 图片密钥(AES + XOR)并返回
+    3. 根据版本注入 Hook
+    4. 抓取数据库密钥并返回
+
+    注意：本接口仅返回数据库密钥(db_key)，不包含图片密钥。
+    图片密钥请调用 /api/get_image_key 单独获取。
     """
     try:
         logger.info(
@@ -244,7 +247,7 @@ async def get_wechat_db_key(wechat_install_path: Optional[str] = None):
         return {
             "status": 0,
             "errmsg": "ok",
-            "data": keys_data # 现在完美包含了 db_key, aes_key, xor_key
+            "data": keys_data  # 仅包含 db_key；图片密钥由 /api/get_image_key 获取
         }
 
     except TimeoutError:
@@ -260,6 +263,27 @@ async def get_wechat_db_key(wechat_install_path: Optional[str] = None):
             "data": {}
         }
 
+
+
+def _parse_xor_key(value: str) -> int:
+    raw = str(value or "").strip()
+    if raw.lower().startswith("0x"):
+        return int(raw, 16)
+    return int(raw)
+
+
+def _parse_aes_key_bytes(value: str) -> bytes:
+    raw = str(value or "").strip()
+    if not raw:
+        return b""
+    try:
+        b = bytes.fromhex(raw)
+        if len(b) >= 16:
+            return b[:16]
+    except Exception:
+        pass
+    b = raw.encode("ascii", errors="ignore")
+    return b[:16] if len(b) >= 16 else b
 
 
 @router.get("/api/get_image_key", summary="获取并保存微信图片密钥")
@@ -295,6 +319,21 @@ async def get_image_key(
             str(result.get("xor_key") or "").strip(),
             _summarize_aes_key(str(result.get("aes_key") or "").strip()),
         )
+
+        # 同步写入 _media_keys.json，确保图片解密函数能读取
+        try:
+            account_for_dir = str(result.get("wxid") or account or "").strip()
+            if account_for_dir:
+                account_dir = _resolve_account_dir(account_for_dir)
+                xor_int = _parse_xor_key(result.get("xor_key", "0"))
+                aes_key16 = _parse_aes_key_bytes(result.get("aes_key", ""))
+                _save_media_keys(account_dir, xor_int, aes_key16)
+                logger.info(
+                    "[keys] 图片密钥已同步写入 _media_keys.json: account=%s xor=0x%02X aes_present=%s",
+                    account_for_dir, xor_int, bool(aes_key16),
+                )
+        except Exception as e:
+            logger.warning("[keys] 写入 _media_keys.json 失败: %s", e)
 
         return {
             "status": 0,
@@ -343,4 +382,37 @@ async def get_image_key(
             "status": -1,
             "errmsg": f"获取失败: {str(e)}",
             "data": {}
+        }
+
+
+@router.get("/api/debug/decrypt_dat", summary="调试：测试单个 .dat 文件解密")
+async def debug_decrypt_dat(path: str, account: Optional[str] = None):
+    """
+    调试接口，用于验证某个 .dat 文件能否被正确解密。
+    返回解密后的 media_type、数据大小、文件头 hex。
+    """
+    from ..media_helpers import _read_and_maybe_decrypt_media
+
+    target = Path(path)
+    if not target.exists() or not target.is_file():
+        return {"status": -1, "errmsg": f"文件不存在: {path}"}
+
+    account_dir = _resolve_account_dir(account) if account else None
+
+    try:
+        data, media_type = _read_and_maybe_decrypt_media(target, account_dir=account_dir)
+        head16 = data[:16].hex()
+        return {
+            "status": 0,
+            "errmsg": "ok",
+            "file": str(target),
+            "file_size": len(data),
+            "media_type": media_type,
+            "head16": head16,
+        }
+    except Exception as e:
+        return {
+            "status": -1,
+            "errmsg": f"解密失败: {e}",
+            "file": str(target),
         }
